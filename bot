@@ -1,0 +1,792 @@
+import html
+import logging
+
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, filters, ContextTypes
+)
+
+import db
+from config import BOT_TOKEN, CHANNEL_ID, WEBAPP_URL, UNIT_PRICES, PREMIUM_PRICES, STARS_UNIT_PRICE, META_VERIFY_PRICE
+from utils import format_price, calc_unit_price
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Bosqichlar (States) - hammasi bot ichida, mini-ilovaga bog'liq emas
+(
+    CHECK_SUB, GET_PHONE, MAIN_MENU,
+    TG_NAKRUTKA_SUB, TG_QUALITY, TG_AMOUNT, TG_LINK,
+    TG_PREMIUM_PERIOD,
+    TG_STARS_USER, TG_STARS_AMOUNT,
+    INSTA_SUB, INSTA_QUALITY, INSTA_AMOUNT, INSTA_LINK,
+    TIKTOK_SUB, TIKTOK_QUALITY, TIKTOK_AMOUNT, TIKTOK_LINK,
+    YT_SUB, YT_QUALITY, YT_AMOUNT, YT_LINK,
+    BOT_BUILD_DESC
+) = range(23)
+
+user_orders = {}
+
+REJECT_REASON_LABELS = {
+    "unpaid": "💸 To'lanmadi",
+    "wrong": "⚠️ Xato buyurtma",
+}
+
+
+# =========================================================
+# --- MAJBURIY OBUNA (bir nechta kanal bo'lishi mumkin) ---
+# =========================================================
+async def check_subscription(user_id, context: ContextTypes.DEFAULT_TYPE):
+    channels = db.get_required_channels()
+    not_subbed = []
+    for ch in channels:
+        try:
+            member = await context.bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                not_subbed.append(ch)
+        except Exception as e:
+            logger.warning(f"{ch} obunasini tekshirishda xatolik: {e}")
+            not_subbed.append(ch)
+    return not_subbed
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    not_subbed = await check_subscription(user_id, context)
+
+    if not_subbed:
+        buttons = [
+            [InlineKeyboardButton(f"📢 {ch}", url=f"https://t.me/{ch.replace('@', '')}")]
+            for ch in not_subbed
+        ]
+        buttons.append([InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_sub")])
+        await update.message.reply_text(
+            "Assalomu alaykum! Botdan foydalanish uchun quyidagi kanal(lar)ga obuna bo'ling:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return CHECK_SUB
+
+    return await request_phone(update, context)
+
+
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    not_subbed = await check_subscription(user_id, context)
+
+    if not not_subbed:
+        await query.message.delete()
+        await context.bot.send_message(chat_id=user_id, text="✅ Obuna tasdiqlandi!")
+        return await request_phone(update, context)
+    else:
+        await query.message.reply_text("❌ Siz hali barcha kanal(lar)ga obuna bo'lmadingiz!")
+        return CHECK_SUB
+
+
+async def request_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    if update.message:
+        await update.message.reply_text("Iltimos, telefon raqamingizni yuboring:", reply_markup=keyboard)
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Iltimos, telefon raqamingizni yuboring:",
+            reply_markup=keyboard
+        )
+    return GET_PHONE
+
+
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    phone = update.message.contact.phone_number if update.message.contact else update.message.text
+    user_orders[user.id] = {'phone': phone}
+    db.save_user(user.id, user.username, user.full_name, phone)
+    return await main_menu(update, context)
+
+
+# =========================================================
+# --- ASOSIY MENYU (hammasi bot ichida) ---
+# =========================================================
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        ["1. Telegram nakrutka", "2. Telegram premium"],
+        ["3. Telegram stars", "4. Instagram nakrutka"],
+        ["5. Meta verify (galochka)", "6. Tik Tok nakrutka"],
+        ["7. YouTube nakrutka", "8. Bot yaratish"],
+        ["📦 Buyurtmalarim"],
+    ]
+    # Mini-ilova ixtiyoriy - deploy qilingan bo'lsa qo'shimcha tugma sifatida chiqadi
+    if WEBAPP_URL and WEBAPP_URL.startswith("https://") and "sizning-domeningiz" not in WEBAPP_URL:
+        keyboard.insert(0, [KeyboardButton("🌐 Chiroyli mini-ilovada buyurtma", web_app=WebAppInfo(url=WEBAPP_URL))])
+    if db.is_admin(update.effective_user.id):
+        keyboard.append(["🛠 Admin buyruqlari"])
+
+    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("Kerakli xizmat turini tanlang:", reply_markup=markup)
+    return MAIN_MENU
+
+
+def get_quality_keyboard():
+    return ReplyKeyboardMarkup([["Kafolatli", "Kafolatsiz"], ["⬅️ Orqaga"]], resize_keyboard=True)
+
+
+def get_back_keyboard():
+    return ReplyKeyboardMarkup([["⬅️ Orqaga"]], resize_keyboard=True)
+
+
+def get_social_keyboard(name):
+    keyboard = [
+        [f"{name} Obunachi", f"{name} Like"],
+        [f"{name} Comment", f"{name} Prasmotr"],
+        [f"{name} Jonli efir kuzatuvchilari"],
+        ["⬅️ Orqaga"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orders = db.get_user_orders(update.effective_user.id)
+    if not orders:
+        await update.message.reply_text("📭 Sizda hali buyurtmalar yo'q.")
+        return MAIN_MENU
+
+    status_map = {"pending": "⏳ Kutilmoqda", "done": "✅ Bajarildi", "rejected": "❌ Rad etildi"}
+    text = "📦 <b>Sizning buyurtmalaringiz:</b>\n\n"
+    for o in orders[:15]:
+        text += f"#{o['id']} — {html.escape(o['service'] or '-')}\n"
+        text += f"   {status_map.get(o['status'], o['status'])}"
+        if o['status'] == 'rejected' and o['reject_reason']:
+            text += f" ({html.escape(o['reject_reason'])})"
+        if o['price']:
+            text += f" · {format_price(o['price'])}"
+        text += "\n\n"
+    await update.message.reply_text(text, parse_mode="HTML")
+    return MAIN_MENU
+
+
+# =========================================================
+# --- 1. TELEGRAM NAKRUTKA ---
+# =========================================================
+async def tg_nakrutka_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        ["Bot uchun", "Kanal yoki guruh"],
+        ["Reaksiya", "Prasmotr"],
+        ["So'rovnoma uchun", "Premium nakrutka"],
+        ["Boost", "⬅️ Orqaga"]
+    ]
+    await update.message.reply_text("Telegram xizmat turini tanlang:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return TG_NAKRUTKA_SUB
+
+
+async def tg_sub_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    user_orders.setdefault(update.effective_user.id, {})['service'] = f"Telegram nakrutka -> {text}"
+    await update.message.reply_text("Sifat turini tanlang:", reply_markup=get_quality_keyboard())
+    return TG_QUALITY
+
+
+async def tg_quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await tg_nakrutka_start(update, context)
+    user_orders[update.effective_user.id]['quality'] = text
+    await update.message.reply_text("Qancha kerakligini kiriting (sonlarda):", reply_markup=get_back_keyboard())
+    return TG_AMOUNT
+
+
+async def tg_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await tg_sub_selected(update, context)
+    order = user_orders[update.effective_user.id]
+    order['amount'] = text
+    order['price'] = calc_unit_price("Telegram nakrutka", text)
+    await update.message.reply_text("Kanal, guruh, bot yoki post havolasini (link) yuboring:", reply_markup=get_back_keyboard())
+    return TG_LINK
+
+
+async def tg_link_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        await update.message.reply_text("Qancha kerakligini kiriting (sonlarda):", reply_markup=get_back_keyboard())
+        return TG_AMOUNT
+    user_orders[update.effective_user.id]['link'] = text
+    return await send_order_to_channel(update, context)
+
+
+# =========================================================
+# --- 2. TELEGRAM PREMIUM ---
+# =========================================================
+async def tg_premium_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_orders.setdefault(update.effective_user.id, {})['service'] = "Telegram Premium"
+    keyboard = [["1 oylik", "3 oylik"], ["6 oylik", "1 yillik"], ["⬅️ Orqaga"]]
+    await update.message.reply_text("Muddatni tanlang:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return TG_PREMIUM_PERIOD
+
+
+async def tg_premium_period_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    order = user_orders[update.effective_user.id]
+    order['details'] = f"Muddat: {text}"
+    order['price'] = PREMIUM_PRICES.get(text, 0)
+    return await send_order_to_channel(update, context)
+
+
+# =========================================================
+# --- 3. TELEGRAM STARS ---
+# =========================================================
+async def tg_stars_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_orders.setdefault(update.effective_user.id, {})['service'] = "Telegram Stars"
+    await update.message.reply_text("Foydalanuvchi nomini (username/ID) kiriting:", reply_markup=get_back_keyboard())
+    return TG_STARS_USER
+
+
+async def tg_stars_user_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    user_orders[update.effective_user.id]['target_user'] = text
+    await update.message.reply_text("Stars miqdorini kiriting:", reply_markup=get_back_keyboard())
+    return TG_STARS_AMOUNT
+
+
+async def tg_stars_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await tg_stars_start(update, context)
+    order = user_orders[update.effective_user.id]
+    order['amount'] = text
+    try:
+        order['price'] = STARS_UNIT_PRICE * int(text)
+    except ValueError:
+        order['price'] = 0
+    return await send_order_to_channel(update, context)
+
+
+# =========================================================
+# --- 4, 6, 7. INSTAGRAM / TIKTOK / YOUTUBE ---
+# =========================================================
+async def insta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Instagram xizmatini tanlang:", reply_markup=get_social_keyboard("Instagram"))
+    return INSTA_SUB
+
+
+async def insta_sub_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    user_orders.setdefault(update.effective_user.id, {})['service'] = text
+    await update.message.reply_text("Sifat turini tanlang:", reply_markup=get_quality_keyboard())
+    return INSTA_QUALITY
+
+
+async def insta_quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await insta_start(update, context)
+    user_orders[update.effective_user.id]['quality'] = text
+    await update.message.reply_text("Qancha kerakligini kiriting:", reply_markup=get_back_keyboard())
+    return INSTA_AMOUNT
+
+
+async def insta_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await insta_sub_selected(update, context)
+    order = user_orders[update.effective_user.id]
+    order['amount'] = text
+    order['price'] = calc_unit_price("Instagram", text)
+    await update.message.reply_text("Sahifa, post yoki reels havolasini (link) yuboring:", reply_markup=get_back_keyboard())
+    return INSTA_LINK
+
+
+async def insta_link_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        await update.message.reply_text("Qancha kerakligini kiriting:", reply_markup=get_back_keyboard())
+        return INSTA_AMOUNT
+    user_orders[update.effective_user.id]['link'] = text
+    return await send_order_to_channel(update, context)
+
+
+# TikTok
+async def tiktok_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("TikTok xizmatini tanlang:", reply_markup=get_social_keyboard("TikTok"))
+    return TIKTOK_SUB
+
+
+async def tiktok_sub_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    user_orders.setdefault(update.effective_user.id, {})['service'] = text
+    await update.message.reply_text("Sifat turini tanlang:", reply_markup=get_quality_keyboard())
+    return TIKTOK_QUALITY
+
+
+async def tiktok_quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await tiktok_start(update, context)
+    user_orders[update.effective_user.id]['quality'] = text
+    await update.message.reply_text("Qancha kerakligini kiriting:", reply_markup=get_back_keyboard())
+    return TIKTOK_AMOUNT
+
+
+async def tiktok_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await tiktok_sub_selected(update, context)
+    order = user_orders[update.effective_user.id]
+    order['amount'] = text
+    order['price'] = calc_unit_price("TikTok", text)
+    await update.message.reply_text("Video yoki profil havolasini (link) yuboring:", reply_markup=get_back_keyboard())
+    return TIKTOK_LINK
+
+
+async def tiktok_link_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        await update.message.reply_text("Qancha kerakligini kiriting:", reply_markup=get_back_keyboard())
+        return TIKTOK_AMOUNT
+    user_orders[update.effective_user.id]['link'] = text
+    return await send_order_to_channel(update, context)
+
+
+# YouTube
+async def yt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("YouTube xizmatini tanlang:", reply_markup=get_social_keyboard("YouTube"))
+    return YT_SUB
+
+
+async def yt_sub_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    user_orders.setdefault(update.effective_user.id, {})['service'] = text
+    await update.message.reply_text("Sifat turini tanlang:", reply_markup=get_quality_keyboard())
+    return YT_QUALITY
+
+
+async def yt_quality_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await yt_start(update, context)
+    user_orders[update.effective_user.id]['quality'] = text
+    await update.message.reply_text("Qancha kerakligini kiriting:", reply_markup=get_back_keyboard())
+    return YT_AMOUNT
+
+
+async def yt_amount_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await yt_sub_selected(update, context)
+    order = user_orders[update.effective_user.id]
+    order['amount'] = text
+    order['price'] = calc_unit_price("YouTube", text)
+    await update.message.reply_text("Video yoki kanal havolasini (link) yuboring:", reply_markup=get_back_keyboard())
+    return YT_LINK
+
+
+async def yt_link_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        await update.message.reply_text("Qancha kerakligini kiriting:", reply_markup=get_back_keyboard())
+        return YT_AMOUNT
+    user_orders[update.effective_user.id]['link'] = text
+    return await send_order_to_channel(update, context)
+
+
+# =========================================================
+# --- 5. META VERIFY ---
+# =========================================================
+async def meta_verify_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    order = user_orders.setdefault(update.effective_user.id, {})
+    order['service'] = "Meta Verify (Galochka)"
+    order['price'] = META_VERIFY_PRICE
+    return await send_order_to_channel(update, context)
+
+
+# =========================================================
+# --- 8. BOT YARATISH ---
+# =========================================================
+async def bot_build_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_orders.setdefault(update.effective_user.id, {})['service'] = "Bot yaratish"
+    await update.message.reply_text("Botingiz haqida tavsif yozing (nima uchun, qanday funksiyalar kerak):", reply_markup=get_back_keyboard())
+    return BOT_BUILD_DESC
+
+
+async def bot_build_desc_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Orqaga":
+        return await main_menu(update, context)
+    order = user_orders[update.effective_user.id]
+    order['details'] = f"Tavsif: {text}"
+    order['price'] = 0
+    return await send_order_to_channel(update, context)
+
+
+# =========================================================
+# --- BUYURTMANI KANALGA YUBORISH ---
+# =========================================================
+async def send_order_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    order = user_orders.get(user.id, {})
+    price = order.get('price', 0)
+
+    order_id = db.save_order({
+        'user_id': user.id,
+        'service': order.get('service', '-'),
+        'quality': order.get('quality'),
+        'amount': order.get('amount'),
+        'link': order.get('link'),
+        'target_user': order.get('target_user'),
+        'details': order.get('details'),
+        'price': price,
+    })
+
+    full_name = html.escape(user.full_name or "")
+    username_safe = html.escape(user.username or "Yo'q")
+
+    text = "📥 <b>Yangi Buyurtma!</b>\n\n"
+    text += f"🆔 <b>Buyurtma raqami:</b> #{order_id}\n"
+    text += f"👤 <b>Mijoz:</b> {full_name} (@{username_safe})\n"
+    text += f"📞 <b>Tel:</b> <code>{html.escape(str(order.get('phone', 'Kiritilmagan')))}</code>\n"
+    text += f"🛠 <b>Xizmat:</b> {html.escape(str(order.get('service', '-')))}\n"
+
+    if order.get('quality'):
+        text += f"✨ <b>Sifat:</b> {html.escape(order['quality'])}\n"
+    if order.get('amount'):
+        text += f"🔢 <b>Miqdor:</b> {html.escape(order['amount'])}\n"
+    if order.get('link'):
+        text += f"🔗 <b>Link:</b> {html.escape(order['link'])}\n"
+    if order.get('target_user'):
+        text += f"🎯 <b>Nishon:</b> {html.escape(order['target_user'])}\n"
+    if order.get('details'):
+        text += f"📝 <b>Batafsil:</b> {html.escape(order['details'])}\n"
+    if price:
+        text += f"💰 <b>Narx:</b> {format_price(price)}\n"
+
+    admin_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Bajarildi", callback_data=f"order_done_{order_id}"),
+        InlineKeyboardButton("❌ Rad etildi", callback_data=f"order_reject_menu_{order_id}")
+    ]])
+
+    try:
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="HTML", reply_markup=admin_keyboard)
+        await update.message.reply_text(f"✅ Buyurtmangiz qabul qilindi! (#{order_id})\nOperatormiz tez orada siz bilan bog'lanadi.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Xatolik: Buyurtma kanalga yuborilmadi.\nSabab: {e}")
+        logger.error(f"Kanalga yuborishda xatolik: {e}")
+
+    return await main_menu(update, context)
+
+
+# =========================================================
+# --- ADMIN: BAJARISH / RAD ETISH / BAHOLASH ---
+# =========================================================
+async def admin_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    message = query.message
+
+    if data.startswith("order_done_"):
+        order_id = int(data.split("_")[2])
+        order = db.get_order(order_id)
+        if not order:
+            await query.edit_message_text("Buyurtma topilmadi.")
+            return
+        target_user_id = order["user_id"]
+        db.update_order_status(order_id, "done")
+
+        base_text = message.text_html or message.text or ""
+        new_text = base_text + "\n\n🟢 <b>TUGALLANDI</b>"
+        await query.edit_message_text(text=new_text, parse_mode="HTML")
+
+        rate_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"{n}⭐", callback_data=f"rate_{order_id}_{n}") for n in range(1, 6)
+        ]])
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text="🎉 Sizning buyurtmangiz muvaffaqiyatli bajarildi!\nXizmatimizni baholab bering:",
+                reply_markup=rate_keyboard
+            )
+        except Exception as e:
+            logger.warning(f"Foydalanuvchiga xabar yuborilmadi: {e}")
+
+    elif data.startswith("order_reject_menu_"):
+        order_id = data.split("_")[3]
+        reason_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💸 To'lanmadi", callback_data=f"reject_unpaid_{order_id}")],
+            [InlineKeyboardButton("⚠️ Xato buyurtma", callback_data=f"reject_wrong_{order_id}")],
+            [InlineKeyboardButton("⬅️ Bekor qilish", callback_data=f"reject_cancel_{order_id}")]
+        ])
+        await query.edit_message_reply_markup(reply_markup=reason_keyboard)
+
+
+async def reject_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    message = query.message
+
+    if data.startswith("reject_cancel_"):
+        order_id = data.split("_")[2]
+        original_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Bajarildi", callback_data=f"order_done_{order_id}"),
+            InlineKeyboardButton("❌ Rad etildi", callback_data=f"order_reject_menu_{order_id}")
+        ]])
+        await query.edit_message_reply_markup(reply_markup=original_keyboard)
+        return
+
+    if data.startswith("reject_unpaid_"):
+        reason_key = "unpaid"
+        order_id = int(data.split("_")[2])
+    elif data.startswith("reject_wrong_"):
+        reason_key = "wrong"
+        order_id = int(data.split("_")[2])
+    else:
+        return
+
+    order = db.get_order(order_id)
+    if not order:
+        await query.edit_message_text("Buyurtma topilmadi.")
+        return
+    target_user_id = order["user_id"]
+    reason_label = REJECT_REASON_LABELS[reason_key]
+
+    db.update_order_status(order_id, "rejected", reason_label)
+
+    base_text = message.text_html or message.text or ""
+    new_text = base_text + f"\n\n🔴 <b>RAD ETILDI</b>\nSabab: {reason_label}"
+    await query.edit_message_text(text=new_text, parse_mode="HTML")
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"❌ Sizning buyurtmangiz rad etildi.\nSabab: {reason_label}"
+        )
+    except Exception as e:
+        logger.warning(f"Foydalanuvchiga xabar yuborilmadi: {e}")
+
+
+async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    parts = data.split("_")
+    order_id = int(parts[1])
+    score = int(parts[2])
+    db.set_rating(order_id, score)
+    await query.answer("Rahmat!")
+    await query.edit_message_text(f"Bahoyingiz uchun rahmat! Siz {score}⭐ qo'ydingiz.")
+
+
+# =========================================================
+# --- ADMIN BUYRUQLARI (hammasi bot ichida, web-ilovasiz) ---
+# =========================================================
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    text = (
+        "🛠 <b>Admin buyruqlari</b>\n\n"
+        "/stats — statistika\n"
+        "/broadcast Matn — hammaga xabar yuborish\n\n"
+        "/admins — adminlar ro'yxati\n"
+        "/addadmin ID — yangi admin qo'shish\n"
+        "/removeadmin ID — adminni o'chirish\n\n"
+        "/channels — majburiy obuna kanallari\n"
+        "/addchannel @kanal — kanal qo'shish\n"
+        "/removechannel @kanal — kanalni o'chirish"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    stats = db.get_stats()
+    text = (
+        "📊 <b>Statistika</b>\n\n"
+        f"👥 Foydalanuvchilar: {stats['total_users']}\n"
+        f"📦 Jami buyurtmalar: {stats['total_orders']}\n"
+        f"✅ Bajarilgan: {stats['done_orders']}\n"
+        f"❌ Rad etilgan: {stats['rejected_orders']}\n"
+        f"⏳ Kutilmoqda: {stats['pending_orders']}\n"
+        f"💰 Jami tushum: {format_price(stats['total_income'])}"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    message_text = update.message.text.partition(' ')[2].strip()
+    if not message_text:
+        await update.message.reply_text("Foydalanish: /broadcast Xabar matni")
+        return
+    user_ids = db.get_all_user_ids()
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=message_text)
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"✅ Yuborildi: {sent} ta\n❌ Yuborilmadi: {failed} ta")
+
+
+async def admins_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    admins = db.get_admins()
+    text = "🛡 <b>Adminlar:</b>\n\n" + "\n".join(f"• {a['user_id']} ({a['username'] or '-'})" for a in admins)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    arg = update.message.text.partition(' ')[2].strip()
+    if not arg.isdigit():
+        await update.message.reply_text("Foydalanish: /addadmin 123456789")
+        return
+    db.add_admin(int(arg))
+    await update.message.reply_text(f"✅ {arg} admin qilib qo'shildi.")
+
+
+async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    arg = update.message.text.partition(' ')[2].strip()
+    if not arg.isdigit():
+        await update.message.reply_text("Foydalanish: /removeadmin 123456789")
+        return
+    ok = db.remove_admin(int(arg))
+    if ok:
+        await update.message.reply_text(f"✅ {arg} adminlikdan chiqarildi.")
+    else:
+        await update.message.reply_text("❌ Bosh adminni o'chirib bo'lmaydi.")
+
+
+async def channels_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    channels = db.get_required_channels()
+    text = "📢 <b>Majburiy obuna kanallari:</b>\n\n" + "\n".join(f"• {c}" for c in channels) if channels else "Kanallar yo'q."
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    arg = update.message.text.partition(' ')[2].strip()
+    if not arg:
+        await update.message.reply_text("Foydalanish: /addchannel @kanal_nomi")
+        return
+    db.add_required_channel(arg)
+    await update.message.reply_text(f"✅ Kanal qo'shildi.")
+
+
+async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db.is_admin(update.effective_user.id):
+        return
+    arg = update.message.text.partition(' ')[2].strip()
+    if not arg:
+        await update.message.reply_text("Foydalanish: /removechannel @kanal_nomi")
+        return
+    if not arg.startswith("@"):
+        arg = "@" + arg
+    db.remove_required_channel(arg)
+    await update.message.reply_text(f"✅ Kanal o'chirildi.")
+
+
+# =========================================================
+# --- MAIN ---
+# =========================================================
+def main():
+    db.init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            CHECK_SUB: [CallbackQueryHandler(check_sub_callback, pattern="^check_sub$")],
+            GET_PHONE: [MessageHandler(filters.CONTACT | filters.TEXT, get_phone)],
+            MAIN_MENU: [
+                MessageHandler(filters.Regex("^1. Telegram nakrutka$"), tg_nakrutka_start),
+                MessageHandler(filters.Regex("^2. Telegram premium$"), tg_premium_start),
+                MessageHandler(filters.Regex("^3. Telegram stars$"), tg_stars_start),
+                MessageHandler(filters.Regex("^4. Instagram nakrutka$"), insta_start),
+                MessageHandler(filters.Regex(r"^5\. Meta verify \(galochka\)$"), meta_verify_start),
+                MessageHandler(filters.Regex("^6. Tik Tok nakrutka$"), tiktok_start),
+                MessageHandler(filters.Regex("^7. YouTube nakrutka$"), yt_start),
+                MessageHandler(filters.Regex("^8. Bot yaratish$"), bot_build_start),
+                MessageHandler(filters.Regex("^📦 Buyurtmalarim$"), my_orders),
+                MessageHandler(filters.Regex("^🛠 Admin buyruqlari$"), admin_help),
+            ],
+            TG_NAKRUTKA_SUB: [MessageHandler(filters.TEXT, tg_sub_selected)],
+            TG_QUALITY: [MessageHandler(filters.TEXT, tg_quality_selected)],
+            TG_AMOUNT: [MessageHandler(filters.TEXT, tg_amount_entered)],
+            TG_LINK: [MessageHandler(filters.TEXT, tg_link_entered)],
+
+            TG_PREMIUM_PERIOD: [MessageHandler(filters.TEXT, tg_premium_period_selected)],
+
+            TG_STARS_USER: [MessageHandler(filters.TEXT, tg_stars_user_entered)],
+            TG_STARS_AMOUNT: [MessageHandler(filters.TEXT, tg_stars_amount_entered)],
+
+            INSTA_SUB: [MessageHandler(filters.TEXT, insta_sub_selected)],
+            INSTA_QUALITY: [MessageHandler(filters.TEXT, insta_quality_selected)],
+            INSTA_AMOUNT: [MessageHandler(filters.TEXT, insta_amount_entered)],
+            INSTA_LINK: [MessageHandler(filters.TEXT, insta_link_entered)],
+
+            TIKTOK_SUB: [MessageHandler(filters.TEXT, tiktok_sub_selected)],
+            TIKTOK_QUALITY: [MessageHandler(filters.TEXT, tiktok_quality_selected)],
+            TIKTOK_AMOUNT: [MessageHandler(filters.TEXT, tiktok_amount_entered)],
+            TIKTOK_LINK: [MessageHandler(filters.TEXT, tiktok_link_entered)],
+
+            YT_SUB: [MessageHandler(filters.TEXT, yt_sub_selected)],
+            YT_QUALITY: [MessageHandler(filters.TEXT, yt_quality_selected)],
+            YT_AMOUNT: [MessageHandler(filters.TEXT, yt_amount_entered)],
+            YT_LINK: [MessageHandler(filters.TEXT, yt_link_entered)],
+
+            BOT_BUILD_DESC: [MessageHandler(filters.TEXT, bot_build_desc_entered)],
+        },
+        fallbacks=[CommandHandler("start", start)]
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("admins", admins_list_command))
+    app.add_handler(CommandHandler("addadmin", add_admin_command))
+    app.add_handler(CommandHandler("removeadmin", remove_admin_command))
+    app.add_handler(CommandHandler("channels", channels_list_command))
+    app.add_handler(CommandHandler("addchannel", add_channel_command))
+    app.add_handler(CommandHandler("removechannel", remove_channel_command))
+    app.add_handler(CallbackQueryHandler(admin_button_callback, pattern="^order_"))
+    app.add_handler(CallbackQueryHandler(reject_reason_callback, pattern="^reject_"))
+    app.add_handler(CallbackQueryHandler(rating_callback, pattern="^rate_"))
+
+    print("Bot muvaffaqiyatli ishga tushdi...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
